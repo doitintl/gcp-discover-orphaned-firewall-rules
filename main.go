@@ -27,25 +27,29 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"text/tabwriter"
 
 	"github.com/sirupsen/logrus"
-	log "github.com/sirupsen/logrus"
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/compute/v1"
 )
 
+var log *logrus.Logger
+
 // FirewallRule contains rule name tags
 type FirewallRule struct {
-	Name string
-	Tags []string
+	Name            string
+	NetworkTags     []string
+	ServiceAccounts []string
 }
 
 // VMInstance contains instance Name and NetworkTags
 type VMInstance struct {
-	Name        string
-	NetworkTags []string
+	Name            string
+	NetworkTags     []string
+	ServiceAccounts []string
 }
 
 // LogrusFileHook filehook formatter
@@ -103,15 +107,19 @@ func isEmptyIntersection(set1, set2 []string) bool {
 	return true
 }
 
-func getFirewallRulesForTargetTags(computeService *compute.Service, projectID string) (*[]FirewallRule, error) {
+func getFirewallRules(computeService *compute.Service, projectID string) (*[]FirewallRule, error) {
 	var rules []FirewallRule
 	ctx := context.Background()
 	req := computeService.Firewalls.List(projectID).Filter(`direction="ingress"`)
 	if err := req.Pages(ctx, func(page *compute.FirewallList) error {
-		log.Info("listing only TargetTags rules...")
+		log.Warn("listing TargetTags, and ServiceAccounts firewall rules...")
 		for _, firewall := range page.Items {
 			if len(firewall.TargetTags) > 0 {
-				rules = append(rules, FirewallRule{Name: firewall.Name, Tags: firewall.TargetTags})
+				rules = append(rules, FirewallRule{Name: firewall.Name, NetworkTags: firewall.TargetTags})
+			}
+
+			if len(firewall.TargetServiceAccounts) > 0 {
+				rules = append(rules, FirewallRule{Name: firewall.Name, ServiceAccounts: firewall.TargetServiceAccounts})
 			}
 		}
 		return nil
@@ -119,8 +127,8 @@ func getFirewallRulesForTargetTags(computeService *compute.Service, projectID st
 		log.Errorf("error getting firewall rules: %v", err)
 		return nil, err
 	}
-	log.Infof("number of TargetTags Rules: %d", len(rules))
-	log.Debugf("firewall Rules: %v", rules)
+	log.Warnf("number of firewall rules: %d", len(rules))
+	log.Debugf("firewall rules: %v", rules)
 	return &rules, nil
 }
 
@@ -133,11 +141,20 @@ func getVMInstances(computeService *compute.Service, projectID string) (*[]VMIns
 	}
 	if err := req.Pages(ctx, func(page *compute.InstanceAggregatedList) error {
 		for _, instancesScopedList := range page.Items {
-			for _, vmInstance := range instancesScopedList.Instances {
-				instances = append(instances, VMInstance{
-					Name:        vmInstance.Name,
-					NetworkTags: vmInstance.Tags.Items,
-				})
+			for _, instance := range instancesScopedList.Instances {
+				instanceData := VMInstance{
+					Name:        instance.Name,
+					NetworkTags: instance.Tags.Items,
+				}
+
+				if len(instance.ServiceAccounts) > 0 {
+					var serviceAccounts []string
+					for _, serviceAccount := range instance.ServiceAccounts {
+						serviceAccounts = append(serviceAccounts, serviceAccount.Email)
+					}
+					instanceData.ServiceAccounts = serviceAccounts
+				}
+				instances = append(instances, instanceData)
 			}
 		}
 		return nil
@@ -149,41 +166,43 @@ func getVMInstances(computeService *compute.Service, projectID string) (*[]VMIns
 	return &instances, nil
 }
 
-func getOrphanedFirewallRules(computeService *compute.Service, projectID string, firewallRules *[]FirewallRule, orphans map[string]FirewallRule) (map[string]FirewallRule, error) {
+func getOrphanedFirewallRules(computeService *compute.Service, projectID string, orphans map[string]FirewallRule) (map[string]FirewallRule, error) {
+	log.Infof("now checking VM Instances in projects: %s", projectID)
+	log.Infof("current firewall rules elimination list size: %d", len(orphans))
 	log.Debug("getting list of VM instances in project...")
 	vmInstances, err := getVMInstances(computeService, projectID)
 	if err != nil {
 		return orphans, err
 	}
 
-	log.Infof("making a list of orphaned rules with all rules (active rules will be removed from it)")
-	for _, rule := range *firewallRules {
-		if rule.Name != "nil" {
-			orphans[rule.Name] = rule
-		}
-		fmt.Printf("%s, %s", projectID, rule.Name)
-	}
-
-	log.Info("looking for orphaned rules in project..")
-	for _, rule := range *firewallRules {
+	log.Info("looking for orphaned rules in project instances..")
+	for _, rule := range orphans {
 		for _, instance := range *vmInstances {
 			if len(instance.NetworkTags) > 0 {
 				log.Debugf(
 					"%v - current rule tags:: %v - VM Instance network tags:: %v - match?: %v",
 					instance.Name,
-					rule.Tags,
+					rule.NetworkTags,
 					instance.NetworkTags,
-					!isEmptyIntersection(rule.Tags, instance.NetworkTags),
+					!isEmptyIntersection(rule.NetworkTags, instance.NetworkTags),
 				)
-				if !isEmptyIntersection(rule.Tags, instance.NetworkTags) {
+				if !isEmptyIntersection(rule.NetworkTags, instance.NetworkTags) {
 					if _, ok := orphans[rule.Name]; ok {
-						log.Infof("remove active rule from orphans list: %v", rule.Name)
+						log.Infof("removing active rule from orphans list: %v", rule.Name)
 						delete(orphans, rule.Name)
 					}
 				}
+			} else if len(instance.ServiceAccounts) > 0 {
+				log.Debugf(
+					"%v - current rule service accounts:: %v - VM Instance service account:: %v - match?: %v",
+					instance.Name,
+					rule.ServiceAccounts,
+					instance.ServiceAccounts,
+					!isEmptyIntersection(rule.ServiceAccounts, instance.ServiceAccounts),
+				)
 			} else {
 				log.Warnf(
-					"skipping instance %v since it does not have any network tags",
+					"skipping instance %v since it does not have any network tags or service accounts",
 					instance.Name,
 				)
 			}
@@ -217,6 +236,7 @@ func getChildProjects(computeService *compute.Service, hostProjectID string) ([]
 func initClient() (*compute.Service, error) {
 	ctx := context.Background()
 	oauthClient, err := google.DefaultClient(ctx, compute.CloudPlatformScope)
+	log.Infof("creating a new Compute API client")
 	computeService, err := compute.New(oauthClient)
 	if err != nil {
 		return nil, err
@@ -224,7 +244,7 @@ func initClient() (*compute.Service, error) {
 	return computeService, nil
 }
 
-func generateCSV(orphanedRules map[string]FirewallRule) error {
+func generateCSV(orphanedRules map[string]FirewallRule) {
 	filename := "orphaned-rules.csv"
 	log.Info("creating a new CSV file: ", filename)
 	file, err := os.Create(filename)
@@ -235,55 +255,57 @@ func generateCSV(orphanedRules map[string]FirewallRule) error {
 
 	if err != nil {
 		log.Errorf("error creating file %s - %v", filename, err)
-		return err
 	}
+
 	records := [][]string{
-		{"rule-name", "rule-tags"},
+		{"name", "targets"},
 	}
 	for _, rule := range orphanedRules {
+		targets := append(rule.NetworkTags, rule.ServiceAccounts...)
 		data := []string{
 			rule.Name,
-			fmt.Sprintf("%v", strings.Join(rule.Tags, ",")),
+			fmt.Sprintf("%v", strings.Join(targets, ",")),
 		}
 		records = append(records, data)
 	}
 	err = writer.WriteAll(records)
 	if err != nil {
-		return err
+		log.Errorf("error saving rules to csv - %v", err)
 	}
-	return nil
 }
 
 func setLogger() *logrus.Logger {
-	lvlDebug := viper.GetBool("debug")
 	logfileName := "orphaned-firewall-rules-gcp.log"
-	var logLevel log.Level
-
-	if lvlDebug {
-		logLevel = log.DebugLevel
-	} else {
-		logLevel = log.InfoLevel
-	}
-
-	logrus := &logrus.Logger{
+	logrusLogger := &logrus.Logger{
 		Out: os.Stdout,
 		Formatter: &logrus.TextFormatter{
 			ForceColors:   true,
 			FullTimestamp: true,
 		},
 		Hooks: make(logrus.LevelHooks),
-		Level: logLevel,
+		Level: logrus.InfoLevel,
 	}
+
+	if viper.GetBool("debug") {
+		logrusLogger.Level = logrus.DebugLevel
+	}
+
+	if viper.GetBool("quiet") {
+		logrusLogger.Level = logrus.WarnLevel
+	}
+
 	fileHook, err := newLogrusFileHook(logfileName, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0666)
 	if err != nil {
 		log.Error("error creating log file: ", logfileName)
 	}
-	logrus.Hooks.Add(fileHook)
-	return logrus
+	logrusLogger.Hooks.Add(fileHook)
+	return logrusLogger
 }
 
 func setCmdLineFlags() {
-	flag.Bool("debug", false, "Set log level")
+	flag.Bool("quiet", false, "Set log level to minimal")
+	flag.Bool("debug", false, "Set log level to debug")
+	flag.Bool("output", false, "Output orphaned rules list (CSV format)")
 	flag.Bool("running", false, "Filter only running VM instances")
 	flag.String("host", "", "Host Project ID < Required>")
 	pflag.CommandLine.AddGoFlagSet(flag.CommandLine)
@@ -291,10 +313,21 @@ func setCmdLineFlags() {
 	viper.BindPFlags(pflag.CommandLine)
 }
 
+func printRules(orphanedRules map[string]FirewallRule) {
+	w := new(tabwriter.Writer)
+	w.Init(os.Stdout, 8, 8, 0, '\t', 0)
+	defer w.Flush()
+	fmt.Fprintf(w, "\n %s\t%s\t", "Name", "Targets")
+	fmt.Fprintf(w, "\n %s\t%s\t", "----", "-------")
+	for _, rule := range orphanedRules {
+		targets := append(rule.NetworkTags, rule.ServiceAccounts...)
+		fmt.Fprintf(w, "\n %s\t%s\t", rule.Name, targets)
+	}
+}
+
 func main() {
 	setCmdLineFlags()
-	log := setLogger()
-	log.Infof("creating a new Compute API client")
+	log = setLogger()
 	computeService, err := initClient()
 	if err != nil {
 		log.Fatalf("error creating compute client: %s", err)
@@ -307,30 +340,42 @@ func main() {
 		log.Errorf("error getting child projects for host project %s, %v", hostProject, err)
 	}
 
-	log.Infof("firewall Rules for host project: %s", hostProject)
-	firewallRules, err := getFirewallRulesForTargetTags(computeService, hostProject)
+	log.Infof("firewall rules for host project: %s", hostProject)
+	firewallRules, err := getFirewallRules(computeService, hostProject)
 	if err != nil {
 		log.Fatalf("error getting firewall rules for host project %s, %v", hostProject, err)
 	}
 
+	log.Info("creating an elimination list of orphaned rules (active rules will be removed")
+
 	orphanedRules := make(map[string]FirewallRule, len(*firewallRules))
-	for _, childProject := range childProjects {
-		log.Infof("child project: %s", childProject)
+	for _, rule := range *firewallRules {
+		orphanedRules[rule.Name] = rule
+	}
+
+	projects := append(childProjects, hostProject)
+	for _, project := range projects {
+		log.Infof("checking project: %s", project)
 		orphanedRules, err = getOrphanedFirewallRules(
 			computeService,
-			childProject,
-			firewallRules,
+			project,
 			orphanedRules,
 		)
 		if err != nil {
-			log.Warnf("Could not check project %s for orphaned rules: %s", childProject, err)
+			log.Warnf("Could not check project %s for orphaned rules: %s", project, err)
 		}
 	}
 
-	log.Info("generating CSV file for orphaned rules...")
-	err = generateCSV(orphanedRules)
-	if err != nil {
-		log.Errorf("error saving rules to csv - %v", err)
+	orphanedRulesSize := len(orphanedRules)
+	if orphanedRulesSize > 0 {
+		if viper.GetBool("output") {
+			log.Info("generating CSV file for orphaned rules...")
+			generateCSV(orphanedRules)
+		}
+		log.Warnf("number of orphaned rules: %d", orphanedRulesSize)
+		printRules(orphanedRules)
+	} else {
+		log.Info("could not find any orphaned rules on any vm instance across all of the child projects for this host project")
 	}
-	log.Info("done!")
+
 }
