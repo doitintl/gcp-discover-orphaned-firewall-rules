@@ -288,7 +288,15 @@ func setCmdLineFlags() {
 	flag.String("host", "", "Host Project ID < Required>")
 	pflag.CommandLine.AddGoFlagSet(flag.CommandLine)
 	pflag.Parse()
+
 	viper.BindPFlags(pflag.CommandLine)
+
+	if !viper.IsSet("host") || viper.GetString("host") == "" {
+		log.Errorf("host flag is not set")
+		flag.PrintDefaults()
+		os.Exit(1)
+	}
+
 }
 
 func main() {
