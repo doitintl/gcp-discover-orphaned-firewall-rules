@@ -292,7 +292,7 @@ func setCmdLineFlags() {
 	viper.BindPFlags(pflag.CommandLine)
 
 	if !viper.IsSet("host") || viper.GetString("host") == "" {
-		log.Errorf("host flag is not set")
+		logrus.Errorf("host flag is not set")
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
